@@ -2,19 +2,19 @@
 #include <cuda/atomic>
 
 #define HISTOGRAM_SIZE 256
-#define NUM_OF_THREADS 256
+#define NUM_OF_THREADS 1024
 #define WRAP_SIZE 32
 
 __device__ void prefix_sum(int arr[], int arr_size) {
     // TODO complete according to hw1
-    int tid = threadIdx.x % HISTOGRAM_SIZE;
+    int tid = threadIdx.x;
     int increment;
     for (int stride = 1; stride < arr_size; stride *= 2) {
-    if (tid >= stride) {
+    if (tid >= stride && tid < arr_size) {
         increment = arr[tid - stride];
     }
     __syncthreads();
-    if (tid >= stride) {
+    if (tid >= stride && tid < arr_size) {
         arr[tid] += increment;
     }
     __syncthreads();
@@ -43,35 +43,44 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
 
     __shared__ int sharedHist[HISTOGRAM_SIZE]; // maybe change to 16 bit ? will be confilcits on same bank 
 
-    int imageStartIndex = bi * IMG_HEIGHT * IMG_WIDTH;
-    int mapStartIndex = bi * TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE;
+    int imageStartIndex = 0;// bi * IMG_HEIGHT * IMG_WIDTH;
+    int mapStartIndex = 0;// bi * TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE;
     int tileStartIndex;
     int insideTileIndex;
     int curIndex;
     for (int i = 0 ; i < TILE_COUNT * TILE_COUNT; i++)
     {
         // calc tile index in image buffer (shared between al threads in block)
-        tileStartIndex = imageStartIndex + i % 8 * TILE_WIDTH + (i / 8) * (TILE_WIDTH *TILE_WIDTH) * TILE_COUNT;
+        tileStartIndex = imageStartIndex + i % TILE_COUNT * TILE_WIDTH + (i / TILE_COUNT) * (TILE_WIDTH *TILE_WIDTH) * TILE_COUNT;
         // zero shared buffer histogram values
-        sharedHist[ti] = 0;
-        __syncthreads();
-        for (int j = 0; j < workForThread; j++)
+        if (ti < 256)
         {
-            // calc index in tile buffer for each thread
-            insideTileIndex = tg * TILE_WIDTH * TILE_COUNT + ti % 64 + 4 * TILE_WIDTH * TILE_COUNT * j;
-            // sum tile index and index inside tile to find relevant byte for thread in cur iteration
-            curIndex = tileStartIndex + insideTileIndex;
-            // update histogram
-            imageVal = in[curIndex];
-            atomicAdd(sharedHist + imageVal, 1);
+            sharedHist[ti] = 0;
         }
+        __syncthreads();
+       for (int j = 0; j < workForThread; j++)
+            {
+                // calc index in tile buffer for each thread
+                insideTileIndex = tg * TILE_WIDTH * TILE_COUNT + ti % TILE_WIDTH + (NUM_OF_THREADS / TILE_WIDTH) * TILE_WIDTH * TILE_COUNT * j;
+                // sum tile index and index inside tile to find relevant byte for thread in cur iteration
+                curIndex = tileStartIndex + insideTileIndex;
+                // update histogram
+                imageVal = in[curIndex];
+                atomicAdd(sharedHist + imageVal, 1);
+        }
+    
         __syncthreads();
         
         // calc CDF using prefix sumpwdon histogram buffer
+
         prefix_sum(sharedHist, HISTOGRAM_SIZE);
+
         __syncthreads();
         // calc map value for each index
-        maps[mapStartIndex + HISTOGRAM_SIZE * i + ti] = (float(sharedHist[ti]) * 255)  / (TILE_WIDTH * TILE_WIDTH);
+        if (ti < 256)
+        {
+            maps[mapStartIndex + HISTOGRAM_SIZE * i + ti] = (float(sharedHist[ti]) * 255)  / (TILE_WIDTH * TILE_WIDTH);
+        }
     }
 
     __syncthreads();
@@ -133,7 +142,7 @@ public:
             {
                 streams[i].streamImageId = img_id;
                 CUDA_CHECK(cudaMemcpyAsync(streams[i].imgIn, img_in , IMG_WIDTH * IMG_HEIGHT,cudaMemcpyHostToDevice, streams[i].stream));
-                process_image_kernel<<<1, 256, 0, streams[i].stream>>>(img_in, streams[i].imgOut, streams[i].taskMaps);
+                process_image_kernel<<<1, NUM_OF_THREADS, 0, streams[i].stream>>>(img_in, streams[i].imgOut, streams[i].taskMaps);
                 CUDA_CHECK(cudaMemcpyAsync(img_out, streams[i].imgOut, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyDeviceToHost, streams[i].stream));
                 return true;
             }
