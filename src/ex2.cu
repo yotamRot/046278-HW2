@@ -2,9 +2,9 @@
 #include <cuda/atomic>
 
 #define HISTOGRAM_SIZE 256
-#define NUM_OF_THREADS 1024
 #define WRAP_SIZE 32
 #define SHARED_MEM_USAGE 3072
+
 
 __device__ void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
@@ -37,7 +37,7 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
     int ti = threadIdx.x;
     int tg = ti / TILE_WIDTH;
     int bi = blockIdx.x;
-    int workForThread = (TILE_WIDTH * TILE_WIDTH) / NUM_OF_THREADS; // in bytes
+    int workForThread = (TILE_WIDTH * TILE_WIDTH) / blockDim.x; // in bytes
     uchar imageVal;
 
     __shared__ int sharedHist[HISTOGRAM_SIZE]; // maybe change to 16 bit ? will be confilcits on same bank 
@@ -60,7 +60,7 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
        for (int j = 0; j < workForThread; j++)
             {
                 // calc index in tile buffer for each thread
-                insideTileIndex = tg * TILE_WIDTH * TILE_COUNT + ti % TILE_WIDTH + (NUM_OF_THREADS / TILE_WIDTH) * TILE_WIDTH * TILE_COUNT * j;
+                insideTileIndex = tg * TILE_WIDTH * TILE_COUNT + ti % TILE_WIDTH + (blockDim.x / TILE_WIDTH) * TILE_WIDTH * TILE_COUNT * j;
                 // sum tile index and index inside tile to find relevant byte for thread in cur iteration
                 curIndex = tileStartIndex + insideTileIndex;
                 // update histogram
@@ -127,8 +127,8 @@ public:
         for (int i = 0; i < STREAM_COUNT; i++) {
             CUDA_CHECK(cudaStreamDestroy(streams[i].stream));
             CUDA_CHECK(cudaFree(streams[i].taskMaps));
-            CUDA_CHECK(cudaFree(streams[i].imgIn));
-            CUDA_CHECK(cudaFree(streams[i].imgOut));
+           // CUDA_CHECK(cudaFree(streams[i].imgIn));
+           // CUDA_CHECK(cudaFree(streams[i].imgOut));
         }
     }
 
@@ -141,7 +141,7 @@ public:
             {
                 streams[i].streamImageId = img_id;
                 //CUDA_CHECK(cudaMemcpyAsync(streams[i].imgIn, img_in , IMG_WIDTH * IMG_HEIGHT,cudaMemcpyHostToDevice, streams[i].stream));
-                process_image_kernel<<<1, NUM_OF_THREADS, 0, streams[i].stream>>>(img_in, img_out, streams[i].taskMaps);
+                process_image_kernel<<<1, 1024, 0, streams[i].stream>>>(img_in, img_out, streams[i].taskMaps);
                 //CUDA_CHECK(cudaMemcpyAsync(img_out, streams[i].imgOut, IMG_WIDTH * IMG_HEIGHT, cudaMemcpyDeviceToHost, streams[i].stream));
                 return true;
             }
@@ -191,10 +191,73 @@ std::unique_ptr<image_processing_server> create_streams_server()
 // TODO implement the persistent kernel
 // TODO implement a function for calculating the threadblocks count
 
-int calc_max_thread_blocks()
+
+struct request
+{
+	int imgID;	
+    	uchar *taskMaps;
+    	uchar *imgIn;
+    	uchar *imgOut;
+};
+class ring_buffer {
+	private:
+		int N;
+		request* _mailbox;
+		cuda::atomic<int> _head, _tail;
+	public:
+
+		ring_buffer(); // def contructor
+		~ring_buffer(){
+            		CUDA_CHECK(cudaFreeHost(_mailbox));
+		} 
+		ring_buffer(int size){
+			 N = size;
+			_head = 0, _tail = 0;
+    			CUDA_CHECK( cudaMallocHost(&_mailbox, sizeof(request)*N ));
+		}
+		__device__ __host__
+		bool push(const request &data) {
+	 		int tail = _tail.load(cuda::memory_order_relaxed);
+	 		if (tail - _head.load(cuda::memory_order_acquire) != N){
+				_mailbox[_tail % N] = data;
+	 			_tail.store(tail + 1, cuda::memory_order_release);
+				return true;
+			} else{
+				return false;
+			}
+	 	}
+		__device__ __host__
+	 	request pop() {
+	 		int head = _head.load(cuda::memory_order_relaxed);
+			request item;
+	 		if (_tail.load(cuda::memory_order_acquire) != _head){
+	 			item = _mailbox[_head % N];
+	 			_head.store(head + 1, cuda::memory_order_release);
+			} else{
+				item.imgID = -1;//item is not valid
+			}
+	 		return item;
+	 	}
+};
+
+__global__
+void process_image_kernel_queue(ring_buffer* cpu_to_gpu, ring_buffer* gpu_to_cpu){
+	request req_i;
+	while(1){
+		req_i = cpu_to_gpu->pop();	
+		if(req_i.imgID != -1){
+    			process_image(req_i.imgIn, req_i.imgOut, req_i.taskMaps);
+			while(!gpu_to_cpu->push(req_i));
+		}	
+	}
+}
+
+
+
+int calc_max_thread_blocks(int threads)
     {
         int register_per_thread = 32;
-        int threads_per_thread_block = NUM_OF_THREADS;
+        int threads_per_thread_block = threads;
         
         //constraints
         cudaDeviceProp deviceProp;
@@ -211,48 +274,65 @@ int calc_max_thread_blocks()
 class queue_server : public image_processing_server
 {
 private:
-    // TODO define queue server context (memory buffers, etc...)
-//	ring_buffer cpu_to_gpu;
-//	ring_buffer gpu_to_cpu;
+	ring_buffer* cpu_to_gpu;
+	ring_buffer* gpu_to_cpu;
+
+	char* cpu_to_gpu_buf;
+	char* gpu_to_cpu_buf;
+	
 public:
     queue_server(int threads)
     {
-//        int tb_num = 3;//TODO calc from calc_max_thread_blocks
-//	int ring_buf_size = 16*3 ;//TODO - calc 2^celling(log2(16*tb_num)/log2(2))
-//
-//	   
-//	// TODO initialize host state
-//	cpu_to_gpu = ring_buffer(ring_buf_size);
-//	gpu_to_cpu = ring_buffer(ring_buf_size);
-        // TODO launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
+        int tb_num = 1;//TODO calc from calc_max_thread_blocks
+	int ring_buf_size = 16*1 ;//TODO - calc 2^celling(log2(16*tb_num)/log2(2))
 
+       	CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_buf,sizeof(ring_buffer)));
+       	CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_buf,sizeof(ring_buffer)));
+
+	cpu_to_gpu = new (cpu_to_gpu_buf) ring_buffer(ring_buf_size);
+	gpu_to_cpu = new (gpu_to_cpu_buf) ring_buffer(ring_buf_size);
+
+        //  launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
+	process_image_kernel_queue<<<tb_num,threads>>>(cpu_to_gpu,gpu_to_cpu);
     }
 
     ~queue_server() override
     {
-        // TODO free resources allocated in constructor
+	cpu_to_gpu->~ring_buffer();
+	gpu_to_cpu->~ring_buffer();
+	cudaFreeHost(cpu_to_gpu_buf);
+	cudaFreeHost(gpu_to_cpu_buf);
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
-  //      // TODO push new task into queue if possible
-  //          request request_i;
-  //          CUDA_CHECK(cudaMemcpyAsync(streams[i].imgIn, img_in , IMG_WIDTH * IMG_HEIGHT,cudaMemcpyHostToDevice, streams[i].stream));
-  //          cpu_to_gpu.push(request_i);
+            request request_i;
+	    request_i.imgID = img_id;
+	    CUDA_CHECK(cudaMalloc((void**)&request_i.taskMaps,  TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE));
+	    request_i.imgIn = img_in;
+	    request_i.imgOut = img_out;
+
+	    //CUDA_CHECK(cudaMemcpyAsync(streams[i].imgIn, img_in , IMG_WIDTH * IMG_HEIGHT,cudaMemcpyHostToDevice, streams[i].stream));
+            if(cpu_to_gpu->push(request_i)){
+		return true;
+	    } else{
+            	CUDA_CHECK(cudaFree(request_i.taskMaps));
+		return false;
+	    }
         return false;
     }
 
     bool dequeue(int *img_id) override
     {
 
-//	    request request_i = gpu_to_cpu.pop();
-//	    cpu_to_gpu.push(request_i);
-//        // TODO query (don't block) the producer-consumer queue for any responses.
-//        return false;
-//
-//        // TODO return the img_id of the request that was completed.
-//        //*img_id = ... 
-//        return true;
+	request request_i = gpu_to_cpu->pop();
+	if(request_i.imgID == -1){
+		return false;// queue is empty
+	} else {
+		*img_id = request_i.imgID;
+            	CUDA_CHECK(cudaFree(request_i.taskMaps));
+		return true;	
+	}
     }
 };
 
@@ -260,36 +340,3 @@ std::unique_ptr<image_processing_server> create_queues_server(int threads)
 {
     return std::make_unique<queue_server>(threads);
 }
-
-struct request
-{
-	int imgID;	
-    	uchar *taskMaps;
-    	uchar *imgIn;
-    	uchar *imgOut;
-};
-
-//class ring_buffer {
-//	private:
-//		static int N;
-//		request _mailbox[N];
-//		cuda::atomic<int> _head, _tail;
-//	public:
-//		ring_buffer(int size){
-//			 N = 1 << size;
-//			_head = 0, _tail = 0;
-//		}
-//		void push(const request &data) {
-//	 		int tail = _tail.load(memory_order_relaxed);
-//	 		while (tail - _head.load(memory_order_acquire) == N);
-//			 _mailbox[_tail % N] = data;
-//	 		_tail.store(tail + 1, memory_order_release);
-//	 	}
-//	 	request pop() {
-//	 		int head = _head.load(memory_order_relaxed);
-//	 		while (_tail.load(memory_order_acquire) == _head);
-//	 		request item = _mailbox[_head % N];
-//	 		_head.store(head + 1, memory_order_release);
-//	 		return item;
-//	 	}
-/
