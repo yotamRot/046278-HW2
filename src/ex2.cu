@@ -114,7 +114,7 @@ public:
         for (int i = 0; i < STREAM_COUNT; i++) {
             CUDA_CHECK(cudaStreamCreate(&streams[i].stream));
             streams[i].streamImageId = INVALID_IMAGE; // avialble
-            CUDA_CHECK(cudaMalloc((void**)&streams[i].taskMaps, TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE));
+            CUDA_CHECK(cudaMalloc((void**)&(streams[i].taskMaps), TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE));
             //CUDA_CHECK(cudaMalloc((void**)&streams[i].imgIn,  IMG_WIDTH * IMG_HEIGHT));
             //CUDA_CHECK(cudaMalloc((void**)&streams[i].imgOut,IMG_WIDTH * IMG_HEIGHT));
         }
@@ -193,7 +193,7 @@ std::unique_ptr<image_processing_server> create_streams_server()
 
 struct request
 {
-	int imgID;	
+	    int imgID;	
     	uchar *taskMaps;
     	uchar *imgIn;
     	uchar *imgOut;
@@ -215,7 +215,7 @@ class ring_buffer {
     			CUDA_CHECK( cudaMallocHost(&_mailbox, sizeof(request)*N ));
 		}
 		__device__ __host__
-		bool push(const request &data) {
+		bool push(const request data) {
 	 		int tail = _tail.load(cuda::memory_order_relaxed);
 	 		if (tail - _head.load(cuda::memory_order_acquire) != N){
 				_mailbox[_tail % N] = data;
@@ -295,8 +295,8 @@ public:
         printf("tb_num %d\n", tb_num);
         printf("ring_buf_size %d\n", ring_buf_size);
 
-        CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_buf,sizeof(ring_buffer)));
-        CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_buf,sizeof(ring_buffer)));
+        CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_buf, sizeof(ring_buffer)));
+        CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_buf, sizeof(ring_buffer)));
 
         cpu_to_gpu = new (cpu_to_gpu_buf) ring_buffer(ring_buf_size);
         gpu_to_cpu = new (gpu_to_cpu_buf) ring_buffer(ring_buf_size);
@@ -315,9 +315,15 @@ public:
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
+        printf("started enqueue, img ID = %d \n", img_id);
         request request_i;
 	    request_i.imgID = img_id;
+        //request_i.taskMaps = NULL;
 	    CUDA_CHECK(cudaMalloc((void**)&request_i.taskMaps,  TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE));
+        printf("enqueue - after, img ID = %d , taskmaps ptr = %p \n", img_id, request_i.taskMaps);
+        CUDA_CHECK(cudaFree(request_i.taskMaps));//TODO remove
+        printf("blalbalblaf\n");
+        fflush(stdout);
 	    request_i.imgIn = img_in;
 	    request_i.imgOut = img_out;
 
@@ -326,6 +332,8 @@ public:
 		    return true;
 	    } else{
             CUDA_CHECK(cudaFree(request_i.taskMaps));
+            printf("eequeue - push failed, img ID = %d , taskmaps ptr = %p \n", img_id, request_i.taskMaps);
+
 		    return false;
 	    }
         return false;
@@ -333,7 +341,9 @@ public:
 
     bool dequeue(int *img_id) override
     {
+        //printf("started dequeue\n");
         request request_i = gpu_to_cpu->pop();
+        //printf("dequeue - after pop, img ID = %d , taskmaps ptr = %p \n", request_i.imgID,request_i.taskMaps);
         if(request_i.imgID == INVALID_IMAGE){
             return false;// queue is empty
         } else {
