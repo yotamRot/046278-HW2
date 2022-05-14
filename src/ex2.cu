@@ -1,11 +1,16 @@
 #include "ex2.h"
 #include <cuda/atomic>
+#include <iostream>
+#include <cstdlib>
+#include <unistd.h>
 
 #define HISTOGRAM_SIZE 256
 #define WRAP_SIZE 32
 #define SHARED_MEM_USAGE 2048
 #define REGISTERS_PER_THREAD 32
 #define INVALID_IMAGE -1
+#define KILL_IMAGE -2
+
 
 __device__ void prefix_sum(int arr[], int arr_size) {
     int tid = threadIdx.x;
@@ -42,7 +47,6 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
 
     __shared__ int sharedHist[HISTOGRAM_SIZE]; // maybe change to 16 bit ? will be confilcits on same bank 
 
-    int mapStartIndex = 0;// bi * TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE;
     int tileStartIndex;
     int insideTileIndex;
     int curIndex;
@@ -83,7 +87,7 @@ void process_image(uchar *in, uchar *out, uchar* maps) {
 
     __syncthreads();
     // interpolate image using given maps buffer
-    interpolate_device(maps + mapStartIndex, in, out);
+    interpolate_device(maps, in, out);
     return; 
 }
 
@@ -183,6 +187,9 @@ std::unique_ptr<image_processing_server> create_streams_server()
 }
 
 
+// __device__ void init_lock() { _lock = new gpu_atomic_int(0); }
+// __device__ void lock(gpu_atomic_int* l) { while (l->exchange(1)); }
+// __device__ void unlock(gpu_atomic_int* l) { l->store(0); };
 
 
 // TODO implement a lock
@@ -194,7 +201,6 @@ std::unique_ptr<image_processing_server> create_streams_server()
 struct request
 {
 	    int imgID;	
-    	uchar *taskMaps;
     	uchar *imgIn;
     	uchar *imgOut;
 };
@@ -203,20 +209,29 @@ class ring_buffer {
 		int N;
 		request* _mailbox;
 		cuda::atomic<int> _head, _tail;
+		std::string type;
 	public:
 
 		ring_buffer(); // def contructor
-		~ring_buffer(){
-            		CUDA_CHECK(cudaFreeHost(_mailbox));
+		~ring_buffer()
+        {
+            CUDA_CHECK(cudaFreeHost(_mailbox));
+            printf("mailbox die %p\n",_mailbox);
+
 		} 
-		ring_buffer(int size){
+		ring_buffer(int size, std::string typeIn)
+        {
 			 N = size;
 			_head = 0, _tail = 0;
-    			CUDA_CHECK( cudaMallocHost(&_mailbox, sizeof(request)*N ));
+            CUDA_CHECK( cudaMallocHost(&_mailbox, sizeof(request)*N ));
+            type = typeIn;
 		}
+
 		__device__ __host__
-		bool push(const request data) {
+		bool push(const request data) 
+        {
 	 		int tail = _tail.load(cuda::memory_order_relaxed);
+            // printf("push function - tail is: %d img id is - %d\n" , tail, data.imgID);
 	 		if (tail - _head.load(cuda::memory_order_acquire) != N){
 				_mailbox[_tail % N] = data;
 	 			_tail.store(tail + 1, cuda::memory_order_release);
@@ -225,9 +240,12 @@ class ring_buffer {
 				return false;
 			}
 	 	}
+
 		__device__ __host__
-	 	request pop() {
+	 	request pop() 
+         {
 	 		int head = _head.load(cuda::memory_order_relaxed);
+            // printf("pop function - head is: %d \n" , head);
 			request item;
 	 		if (_tail.load(cuda::memory_order_acquire) != _head){
 	 			item = _mailbox[_head % N];
@@ -240,13 +258,45 @@ class ring_buffer {
 };
 
 __global__
-void process_image_kernel_queue(ring_buffer* cpu_to_gpu, ring_buffer* gpu_to_cpu){
-	request req_i;
-	while(1){
-		req_i = cpu_to_gpu->pop();	
-		if(req_i.imgID != INVALID_IMAGE){
-    			process_image(req_i.imgIn, req_i.imgOut, req_i.taskMaps);
-			while(!gpu_to_cpu->push(req_i));
+void process_image_kernel_queue(ring_buffer* cpu_to_gpu, ring_buffer* gpu_to_cpu, uchar* maps)
+{
+	__shared__ request req_i;
+    int tid = threadIdx.x;
+    uchar* block_maps = maps + blockIdx.x * TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE;
+	while(1)
+    {
+
+        if (tid == 0)
+        {
+            req_i = cpu_to_gpu->pop();
+        }
+
+        // got request to stop
+        if (req_i.imgID == KILL_IMAGE)
+        {
+            if (tid == 0)
+            {
+                printf("goodbye\n");
+            }
+             __syncthreads();
+            return;
+        }
+		else if (req_i.imgID != INVALID_IMAGE && req_i.imgID != KILL_IMAGE) 
+        {
+
+
+            //  printf("image id poped by gpu = %d\n",req_i.imgID);
+
+            __syncthreads();
+             process_image(req_i.imgIn, req_i.imgOut, block_maps);
+             __syncthreads();
+
+            if(tid == 0) {
+                // printf("gpu proccess - befor push image id : %d\n", req_i.imgID);
+                while(!gpu_to_cpu->push(req_i));
+                // printf("gpu proccess - affter push image id : %d\n", req_i.imgID);
+
+            }
 		}	
 	}
 }
@@ -257,8 +307,7 @@ int calc_max_thread_blocks(int threads)
     {
         cudaDeviceProp deviceProp;
         CUDA_CHECK(cudaGetDeviceProperties(&deviceProp, 0));
-        // int wraps_per_block = threads / deviceProp.warpSize;
-        // int register_per_wrap = register_per_thread * deviceProp.warpSize;
+
 
           //constraints
         // int max_tb_sm = deviceProp.maxBlocksPerMultiProcessor;
@@ -285,54 +334,59 @@ private:
 
 	char* cpu_to_gpu_buf;
 	char* gpu_to_cpu_buf;
+	uchar* server_maps;
 	
 public:
     queue_server(int threads)
     {
         int tb_num = calc_max_thread_blocks(threads);//TODO calc from calc_max_thread_blocks
-        int ring_buf_size = std::pow(2, std::ceil(std::log(16*tb_num)/std::log(2))); ;//TODO - calc 2^celling(log2(16*tb_num)/log2(2))
-
+        int ring_buf_size = std::pow(2, std::ceil(std::log(16*tb_num)/std::log(2)));//TODO - calc 2^celling(log2(16*tb_num)/log2(2))
+        
         printf("tb_num %d\n", tb_num);
         printf("ring_buf_size %d\n", ring_buf_size);
 
+        CUDA_CHECK(cudaMalloc((void**)&server_maps, tb_num * TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE));
+
         CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_buf, sizeof(ring_buffer)));
         CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_buf, sizeof(ring_buffer)));
-
-        cpu_to_gpu = new (cpu_to_gpu_buf) ring_buffer(ring_buf_size);
-        gpu_to_cpu = new (gpu_to_cpu_buf) ring_buffer(ring_buf_size);
+        std::string s1 = "cpu to gpu";    
+        std::string s2 = "gpu to cpu";    
+        cpu_to_gpu = new (cpu_to_gpu_buf) ring_buffer(ring_buf_size, s1);
+        gpu_to_cpu = new (gpu_to_cpu_buf) ring_buffer(ring_buf_size, s2);
 
             //  launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
-        process_image_kernel_queue<<<tb_num,threads>>>(cpu_to_gpu,gpu_to_cpu);
+        // process_image_kernel_queue<<<tb_num,threads>>>(cpu_to_gpu,gpu_to_cpu, server_maps);
+        
+        process_image_kernel_queue<<<1, 1024>>>(cpu_to_gpu, gpu_to_cpu, server_maps);
     }
 
     ~queue_server() override
     {
+        //Kill kernel
+        CUDA_CHECK(cudaGetLastError()); 
+        this->enqueue(KILL_IMAGE, NULL, NULL);
+        CUDA_CHECK(cudaDeviceSynchronize()); 
         cpu_to_gpu->~ring_buffer();
         gpu_to_cpu->~ring_buffer();
-        cudaFreeHost(cpu_to_gpu_buf);
-        cudaFreeHost(gpu_to_cpu_buf);
+        CUDA_CHECK(cudaFreeHost(cpu_to_gpu_buf));
+        CUDA_CHECK(cudaFreeHost(gpu_to_cpu_buf));
+        CUDA_CHECK(cudaFree(server_maps));
+
     }
 
     bool enqueue(int img_id, uchar *img_in, uchar *img_out) override
     {
-        printf("started enqueue, img ID = %d \n", img_id);
+        // usleep(1000000);
+        
+        // printf("started enqueue, img ID = %d \n", img_id);
         request request_i;
 	    request_i.imgID = img_id;
-        //request_i.taskMaps = NULL;
-	    CUDA_CHECK(cudaMalloc((void**)&request_i.taskMaps,  TILE_COUNT * TILE_COUNT * HISTOGRAM_SIZE));
-        printf("enqueue - after, img ID = %d , taskmaps ptr = %p \n", img_id, request_i.taskMaps);
-        CUDA_CHECK(cudaFree(request_i.taskMaps));//TODO remove
-        printf("blalbalblaf\n");
-        fflush(stdout);
 	    request_i.imgIn = img_in;
 	    request_i.imgOut = img_out;
 
-	    //CUDA_CHECK(cudaMemcpyAsync(streams[i].imgIn, img_in , IMG_WIDTH * IMG_HEIGHT,cudaMemcpyHostToDevice, streams[i].stream));
         if(cpu_to_gpu->push(request_i)){
 		    return true;
 	    } else{
-            CUDA_CHECK(cudaFree(request_i.taskMaps));
-            printf("eequeue - push failed, img ID = %d , taskmaps ptr = %p \n", img_id, request_i.taskMaps);
 
 		    return false;
 	    }
@@ -341,14 +395,14 @@ public:
 
     bool dequeue(int *img_id) override
     {
-        //printf("started dequeue\n");
+
+        // printf("cpu started dequeue\n");
         request request_i = gpu_to_cpu->pop();
-        //printf("dequeue - after pop, img ID = %d , taskmaps ptr = %p \n", request_i.imgID,request_i.taskMaps);
+        // printf("cpu dequeue - after pop, img ID = %d , taskmaps ptr = %p \n", request_i.imgID,request_i.taskMaps);
         if(request_i.imgID == INVALID_IMAGE){
             return false;// queue is empty
         } else {
             *img_id = request_i.imgID;
-                    CUDA_CHECK(cudaFree(request_i.taskMaps));
             return true;	
         }
     }
