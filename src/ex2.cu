@@ -186,11 +186,34 @@ std::unique_ptr<image_processing_server> create_streams_server()
     return std::make_unique<streams_server>();
 }
 
+typedef cuda::atomic<int, cuda::thread_scope_device> gpu_atomic_int;
+__device__ gpu_atomic_int* push_lock;
+__device__ gpu_atomic_int* pop_lock;
 
-// __device__ void init_lock() { _lock = new gpu_atomic_int(0); }
-// __device__ void lock(gpu_atomic_int* l) { while (l->exchange(1)); }
-// __device__ void unlock(gpu_atomic_int* l) { l->store(0); };
+__global__
+void init_locks() 
+{ 
+    push_lock = new gpu_atomic_int(0); 
+    pop_lock = new gpu_atomic_int(0); 
+}
 
+__global__
+void free_locks() 
+{ 
+    delete push_lock; 
+    delete pop_lock; 
+}
+__device__
+ void lock(gpu_atomic_int * l) 
+{
+    while (l->exchange(1, cuda::memory_order_acq_rel ));
+}
+
+__device__
+ void unlock(gpu_atomic_int * l) 
+{
+    l->store(0, cuda::memory_order_release );
+}
 
 // TODO implement a lock
 // TODO implement a MPMC queue
@@ -216,8 +239,6 @@ class ring_buffer {
 		~ring_buffer()
         {
             CUDA_CHECK(cudaFreeHost(_mailbox));
-            printf("mailbox die %p\n",_mailbox);
-
 		} 
 		ring_buffer(int size, std::string typeIn)
         {
@@ -267,19 +288,17 @@ void process_image_kernel_queue(ring_buffer* cpu_to_gpu, ring_buffer* gpu_to_cpu
     {
 
         if (tid == 0)
-        {
+        {   
+            lock(pop_lock);
             req_i = cpu_to_gpu->pop();
+            unlock(pop_lock);
         }
 
         // got request to stop
+        __syncthreads();
         if (req_i.imgID == KILL_IMAGE)
         {
-            if (tid == 0)
-            {
-                printf("goodbye\n");
-            }
-             __syncthreads();
-            return;
+          return;
         }
 		else if (req_i.imgID != INVALID_IMAGE && req_i.imgID != KILL_IMAGE) 
         {
@@ -293,7 +312,9 @@ void process_image_kernel_queue(ring_buffer* cpu_to_gpu, ring_buffer* gpu_to_cpu
 
             if(tid == 0) {
                 // printf("gpu proccess - befor push image id : %d\n", req_i.imgID);
+                lock(push_lock);
                 while(!gpu_to_cpu->push(req_i));
+                unlock(push_lock);
                 // printf("gpu proccess - affter push image id : %d\n", req_i.imgID);
 
             }
@@ -335,11 +356,12 @@ private:
 	char* cpu_to_gpu_buf;
 	char* gpu_to_cpu_buf;
 	uchar* server_maps;
+    int tb_num;
 	
 public:
     queue_server(int threads)
     {
-        int tb_num = calc_max_thread_blocks(threads);//TODO calc from calc_max_thread_blocks
+        tb_num = calc_max_thread_blocks(threads);//TODO calc from calc_max_thread_blocks
         int ring_buf_size = std::pow(2, std::ceil(std::log(16*tb_num)/std::log(2)));//TODO - calc 2^celling(log2(16*tb_num)/log2(2))
         
         printf("tb_num %d\n", tb_num);
@@ -357,14 +379,21 @@ public:
             //  launch GPU persistent kernel with given number of threads, and calculated number of threadblocks
         // process_image_kernel_queue<<<tb_num,threads>>>(cpu_to_gpu,gpu_to_cpu, server_maps);
         
-        process_image_kernel_queue<<<1, 1024>>>(cpu_to_gpu, gpu_to_cpu, server_maps);
+        init_locks<<<1, 1>>>();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        process_image_kernel_queue<<<tb_num, threads>>>(cpu_to_gpu, gpu_to_cpu, server_maps);
     }
 
     ~queue_server() override
     {
         //Kill kernel
-        CUDA_CHECK(cudaGetLastError()); 
-        this->enqueue(KILL_IMAGE, NULL, NULL);
+        for (int i = 0 ; i<tb_num; i++)
+        {
+            // send enough kills to kill all tb
+            this->enqueue(KILL_IMAGE, NULL, NULL);
+        }
+        CUDA_CHECK(cudaDeviceSynchronize()); 
+        free_locks<<<1, 1>>>();
         CUDA_CHECK(cudaDeviceSynchronize()); 
         cpu_to_gpu->~ring_buffer();
         gpu_to_cpu->~ring_buffer();
