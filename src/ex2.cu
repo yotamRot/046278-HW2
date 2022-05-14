@@ -272,8 +272,8 @@ int calc_max_thread_blocks(int threads)
         int max_tb_threads_constraint = max_threads_per_sm / threads;
 
         int max_tb = std::min(max_tb_mem_constraint,std::min(max_tb_reg_constraint, max_tb_threads_constraint));
-
-        return max_tb;
+        int max_num_sm = deviceProp.multiProcessorCount;
+        return max_num_sm * max_tb;
 
     }
 
@@ -292,8 +292,8 @@ public:
         int tb_num = calc_max_thread_blocks(threads);//TODO calc from calc_max_thread_blocks
         int ring_buf_size = std::pow(2, std::ceil(std::log(16*tb_num)/std::log(2))); ;//TODO - calc 2^celling(log2(16*tb_num)/log2(2))
 
-        printf("tb_num %d", tb_num);
-        printf("ring_buf_size %d", ring_buf_size);
+        printf("tb_num %d\n", tb_num);
+        printf("ring_buf_size %d\n", ring_buf_size);
 
         CUDA_CHECK(cudaMallocHost(&cpu_to_gpu_buf,sizeof(ring_buffer)));
         CUDA_CHECK(cudaMallocHost(&gpu_to_cpu_buf,sizeof(ring_buffer)));
