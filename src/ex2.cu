@@ -338,7 +338,7 @@ int calc_max_thread_blocks(int threads)
         // int max_block_per_sm = deviceProp.maxBlocksPerMultiProcessor;
 
         int max_tb_mem_constraint = max_shared_mem_sm / SHARED_MEM_USAGE;
-        int max_tb_reg_constraint = max_regs_per_sm / REGISTERS_PER_THREAD;
+        int max_tb_reg_constraint = max_regs_per_sm / (REGISTERS_PER_THREAD * threads);
         int max_tb_threads_constraint = max_threads_per_sm / threads;
 
         int max_tb = std::min(max_tb_mem_constraint,std::min(max_tb_reg_constraint, max_tb_threads_constraint));
