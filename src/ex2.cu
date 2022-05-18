@@ -206,13 +206,17 @@ void free_locks()
 __device__
  void lock(gpu_atomic_int * l) 
 {
-    while (l->exchange(1, cuda::memory_order_acq_rel ));
+   do 
+    {
+        while (l->load(cuda::memory_order_relaxed)) continue;
+    } while (l->exchange(1, cuda::memory_order_relaxed)); // actual atomic locking
+  
+   // while (l->exchange(1, cuda::memory_order_acq_rel));
 }
-
 __device__
  void unlock(gpu_atomic_int * l) 
 {
-    l->store(0, cuda::memory_order_release );
+    l->store(0, cuda::memory_order_release);
 }
 
 // TODO implement a lock
@@ -254,7 +258,7 @@ class ring_buffer {
 	 		int tail = _tail.load(cuda::memory_order_relaxed);
             // printf("push function - tail is: %d img id is - %d\n" , tail, data.imgID);
 	 		if (tail - _head.load(cuda::memory_order_acquire) != N){
-				_mailbox[_tail % N] = data;
+				_mailbox[tail % N] = data;
 	 			_tail.store(tail + 1, cuda::memory_order_release);
 				return true;
 			} else{
@@ -268,8 +272,8 @@ class ring_buffer {
 	 		int head = _head.load(cuda::memory_order_relaxed);
             // printf("pop function - head is: %d \n" , head);
 			request item;
-	 		if (_tail.load(cuda::memory_order_acquire) != _head){
-	 			item = _mailbox[_head % N];
+	 		if (_tail.load(cuda::memory_order_acquire) != head){
+	 			item = _mailbox[head % N];
 	 			_head.store(head + 1, cuda::memory_order_release);
 			} else{
 				item.imgID = INVALID_IMAGE;//item is not valid
